@@ -1,5 +1,10 @@
-use core::ptr::NonNull;
+use core::{
+    pin::Pin,
+    ptr::NonNull,
+    task::{Context, Poll},
+};
 use log::{info, warn};
+use futures::task::AtomicWaker;
 use tock_registers::{
     interfaces::{Readable, Writeable},
     register_structs,
@@ -29,6 +34,7 @@ register_structs! {
 
 pub struct Uart {
     pub base: NonNull<UartRegs>,
+    waker: AtomicWaker,
 }
 
 unsafe impl Send for Uart {}
@@ -38,6 +44,7 @@ impl Uart {
     pub const fn new(base: *mut u8) -> Self {
         Self {
             base: NonNull::new(base).unwrap().cast(),
+            waker: AtomicWaker::new(),
         }
     }
 
@@ -63,12 +70,12 @@ impl Uart {
     }
 
     // 发送数据
-    pub fn send(&self, data: u8) {
-        let uart = unsafe { self.base.as_ref() };
-        if uart.uartfr.get() & (1 << 5) == 0 {
-            //info!("FIFO not empty, waiting to send data");
+    pub fn write<'a>(&'a mut self, data: &'a [u8]) -> impl Future<Output = usize> + 'a {
+        WriteFuture {
+            uart: self,
+            data,
+            index: 0,
         }
-        uart.uartdr.set(data as u32);
     }
 
     // 接收数据
@@ -79,5 +86,37 @@ impl Uart {
             return 0; // 或者返回一个错误值
         }
         uart.uartdr.get() as u8
+    }
+
+    pub fn handle_interrupt(&mut self) {}
+}
+
+pub struct WriteFuture<'a> {
+    uart: &'a Uart,
+    data: &'a [u8],
+    index: usize,
+}
+
+impl Future for WriteFuture<'_> {
+    type Output = usize;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        unsafe {
+            loop {
+                if this.index >= this.data.len() {
+                    return Poll::Ready(this.index);
+                }
+
+                if this.uart.base.as_ref().uartfr.get() & (1 << 5) != 0 {
+                    this.uart.waker.register(_cx.waker());
+                    return Poll::Pending;
+                }
+
+                let data = this.data[this.index];
+                this.uart.base.as_ref().uartdr.set(data as u32);
+                this.index += 1;
+            }
+        }
     }
 }
